@@ -7,9 +7,13 @@ use crate::providers::blocklist::BlocklistProvider;
 use crate::providers::tor::TorProvider;
 use crate::providers::{Action, ProviderError, ReputationProvider, ReputationResult};
 use async_trait::async_trait;
-use sentinel_agent_sdk::{Agent, Decision, Request, Response};
+use sentinel_agent_sdk::prelude::*;
+use sentinel_agent_sdk::v2::prelude::*;
+use sentinel_agent_sdk::v2::{DrainReason, MetricsReport, ShutdownReason};
+use sentinel_agent_protocol::v2::{CounterMetric, GaugeMetric};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -20,6 +24,20 @@ pub struct IpReputationAgent {
     allowlist: Vec<AllowlistEntry>,
     #[allow(dead_code)] // Cache is held for providers' shared access
     cache: Arc<ReputationCache>,
+    /// Total requests processed.
+    requests_total: AtomicU64,
+    /// Total requests blocked.
+    requests_blocked: AtomicU64,
+    /// Total requests allowed.
+    requests_allowed: AtomicU64,
+    /// Total requests flagged.
+    requests_flagged: AtomicU64,
+    /// Total lookup failures.
+    lookup_failures: AtomicU64,
+    /// Total allowlist matches.
+    allowlist_matches: AtomicU64,
+    /// Whether the agent is draining (not accepting new requests).
+    draining: AtomicBool,
 }
 
 impl IpReputationAgent {
@@ -96,7 +114,39 @@ impl IpReputationAgent {
             providers,
             allowlist,
             cache,
+            requests_total: AtomicU64::new(0),
+            requests_blocked: AtomicU64::new(0),
+            requests_allowed: AtomicU64::new(0),
+            requests_flagged: AtomicU64::new(0),
+            lookup_failures: AtomicU64::new(0),
+            allowlist_matches: AtomicU64::new(0),
+            draining: AtomicBool::new(false),
         })
+    }
+
+    /// Check if the agent is currently draining.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    /// Get total requests processed.
+    pub fn total_requests(&self) -> u64 {
+        self.requests_total.load(Ordering::Relaxed)
+    }
+
+    /// Get total requests blocked.
+    pub fn total_blocked(&self) -> u64 {
+        self.requests_blocked.load(Ordering::Relaxed)
+    }
+
+    /// Get total requests allowed.
+    pub fn total_allowed(&self) -> u64 {
+        self.requests_allowed.load(Ordering::Relaxed)
+    }
+
+    /// Get total requests flagged.
+    pub fn total_flagged(&self) -> u64 {
+        self.requests_flagged.load(Ordering::Relaxed)
     }
 
     /// Extract client IP from request headers.
@@ -210,7 +260,7 @@ pub fn extract_client_ip(
                 value.split(',').next()?.trim()
             } else {
                 // Use the last IP (closest proxy)
-                value.split(',').last()?.trim()
+                value.split(',').next_back()?.trim()
             };
 
             if let Ok(ip) = ip_str.parse() {
@@ -231,10 +281,25 @@ fn flatten_headers(headers: &HashMap<String, Vec<String>>) -> HashMap<String, St
 
 #[async_trait]
 impl Agent for IpReputationAgent {
+    fn name(&self) -> &str {
+        "ip-reputation"
+    }
+
     async fn on_request(&self, request: &Request) -> Decision {
+        // Increment request counter
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+
         // Check global kill switch
         if !self.config.settings.enabled {
             debug!("IP Reputation agent disabled globally");
+            self.requests_allowed.fetch_add(1, Ordering::Relaxed);
+            return Decision::allow();
+        }
+
+        // Check if draining - skip processing for new requests
+        if self.is_draining() {
+            debug!("Agent is draining, allowing request without checks");
+            self.requests_allowed.fetch_add(1, Ordering::Relaxed);
             return Decision::allow();
         }
 
@@ -252,6 +317,8 @@ impl Agent for IpReputationAgent {
         // Check allowlist
         if self.is_allowlisted(&ip) {
             debug!(ip = %ip, "IP is allowlisted");
+            self.requests_allowed.fetch_add(1, Ordering::Relaxed);
+            self.allowlist_matches.fetch_add(1, Ordering::Relaxed);
             return Decision::allow()
                 .with_tag("ip-reputation:allowlisted");
         }
@@ -261,14 +328,17 @@ impl Agent for IpReputationAgent {
             Ok(result) => result,
             Err(e) => {
                 warn!(ip = %ip, error = %e, "Reputation lookup failed");
+                self.lookup_failures.fetch_add(1, Ordering::Relaxed);
 
                 // Apply fail action
                 return match self.config.settings.fail_action {
                     FailAction::Allow => {
+                        self.requests_allowed.fetch_add(1, Ordering::Relaxed);
                         Decision::allow()
                             .with_tag("ip-reputation:lookup-failed:allowed")
                     }
                     FailAction::Block => {
+                        self.requests_blocked.fetch_add(1, Ordering::Relaxed);
                         Decision::block(403)
                             .with_block_header("x-ip-reputation-error", "lookup-failed")
                             .with_tag("ip-reputation:lookup-failed:blocked")
@@ -280,6 +350,8 @@ impl Agent for IpReputationAgent {
         // Determine final decision
         match combined.action {
             Action::Block => {
+                self.requests_blocked.fetch_add(1, Ordering::Relaxed);
+
                 let score_str = combined
                     .highest_score
                     .map(|s| s.to_string())
@@ -312,6 +384,8 @@ impl Agent for IpReputationAgent {
                 decision
             }
             Action::Flag => {
+                self.requests_flagged.fetch_add(1, Ordering::Relaxed);
+
                 let score_str = combined
                     .highest_score
                     .map(|s| s.to_string())
@@ -340,6 +414,8 @@ impl Agent for IpReputationAgent {
                 decision
             }
             Action::Allow => {
+                self.requests_allowed.fetch_add(1, Ordering::Relaxed);
+
                 if self.config.settings.log_allowed {
                     debug!(ip = %ip, "Allowing request");
                 }
@@ -353,6 +429,135 @@ impl Agent for IpReputationAgent {
     async fn on_response(&self, _request: &Request, _response: &Response) -> Decision {
         // IP Reputation agent only operates on requests
         Decision::allow()
+    }
+
+    async fn on_configure(&self, config: serde_json::Value) -> Result<(), String> {
+        // v2 configuration update support
+        if config.is_null() {
+            return Ok(());
+        }
+
+        // Log the configuration update
+        info!(
+            config = %config,
+            "Received configuration update"
+        );
+
+        // For now, we just acknowledge the config - full hot-reload would require
+        // more complex state management
+        Ok(())
+    }
+}
+
+/// v2 Protocol implementation for IpReputationAgent.
+impl AgentV2 for IpReputationAgent {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new("ip-reputation", "IP Reputation Agent", env!("CARGO_PKG_VERSION"))
+            .with_config_push(true)
+            .with_health_reporting(true)
+            .with_metrics_export(true)
+            .with_concurrent_requests(100)
+            .with_cancellation(true)
+            .with_max_processing_time_ms(5000)
+    }
+
+    fn health_status(&self) -> HealthStatus {
+        // Report healthy unless we're draining
+        if self.is_draining() {
+            HealthStatus::degraded(
+                "ip-reputation",
+                vec!["ip-checks".to_string()],
+                1.0,
+            )
+        } else {
+            HealthStatus::healthy("ip-reputation")
+        }
+    }
+
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        let mut report = MetricsReport::new("ip-reputation", 10_000);
+
+        // Add counter metrics
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_requests_total",
+            self.total_requests(),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_requests_blocked_total",
+            self.total_blocked(),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_requests_allowed_total",
+            self.total_allowed(),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_requests_flagged_total",
+            self.total_flagged(),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_lookup_failures_total",
+            self.lookup_failures.load(Ordering::Relaxed),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "ip_reputation_allowlist_matches_total",
+            self.allowlist_matches.load(Ordering::Relaxed),
+        ));
+
+        // Add gauge metrics
+        report.gauges.push(GaugeMetric::new(
+            "ip_reputation_providers_enabled",
+            self.providers.iter().filter(|p| p.is_enabled()).count() as f64,
+        ));
+
+        report.gauges.push(GaugeMetric::new(
+            "ip_reputation_agent_enabled",
+            if self.config.settings.enabled { 1.0 } else { 0.0 },
+        ));
+
+        report.gauges.push(GaugeMetric::new(
+            "ip_reputation_agent_draining",
+            if self.is_draining() { 1.0 } else { 0.0 },
+        ));
+
+        report.gauges.push(GaugeMetric::new(
+            "ip_reputation_allowlist_entries",
+            self.allowlist.len() as f64,
+        ));
+
+        report.gauges.push(GaugeMetric::new(
+            "ip_reputation_cache_entries",
+            self.cache.len() as f64,
+        ));
+
+        Some(report)
+    }
+
+    fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            reason = ?reason,
+            grace_period_ms = grace_period_ms,
+            "IP Reputation agent shutdown requested"
+        );
+        // Set draining flag to stop processing new requests
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        warn!(
+            reason = ?reason,
+            duration_ms = duration_ms,
+            "IP Reputation agent drain requested - stopping IP checks"
+        );
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn on_stream_closed(&self) {
+        debug!("gRPC stream closed");
     }
 }
 

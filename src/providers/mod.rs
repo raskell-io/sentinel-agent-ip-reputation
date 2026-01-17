@@ -110,11 +110,10 @@ pub enum Action {
 impl Action {
     /// Returns true if this action is more severe than the other.
     pub fn is_more_severe_than(&self, other: &Action) -> bool {
-        match (self, other) {
-            (Action::Block, Action::Flag | Action::Allow) => true,
-            (Action::Flag, Action::Allow) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (Action::Block, Action::Flag | Action::Allow) | (Action::Flag, Action::Allow)
+        )
     }
 }
 
