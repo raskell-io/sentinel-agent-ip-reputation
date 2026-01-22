@@ -459,12 +459,15 @@ impl AgentHandlerV2 for IpReputationAgent {
         AgentCapabilities::new("ip-reputation", "IP Reputation Agent", env!("CARGO_PKG_VERSION"))
             .with_event(EventType::RequestHeaders)
             .with_features(AgentFeatures {
+                streaming_body: false,
+                websocket: false,
+                guardrails: false,
                 config_push: true,
                 health_reporting: true,
                 metrics_export: true,
                 concurrent_requests: 100,
                 cancellation: true,
-                max_processing_time_ms: 5000,
+                flow_control: false,
             })
     }
 
@@ -563,7 +566,7 @@ impl AgentHandlerV2 for IpReputationAgent {
         self.draining.store(true, Ordering::SeqCst);
     }
 
-    fn on_stream_closed(&self) {
+    async fn on_stream_closed(&self) {
         debug!("gRPC stream closed");
     }
 }
